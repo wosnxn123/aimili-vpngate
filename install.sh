@@ -1,11 +1,51 @@
 #!/usr/bin/env bash
 set -e
 
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "错误: 请使用 bash 运行此脚本。Alpine 可先执行: apk add --no-cache bash curl"
+    exit 1
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+set_sysctl_value() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    if grep -q "^${key}[[:space:]]*=" "$file"; then
+        sed -i "s|^${key}[[:space:]]*=.*|${key} = ${value}|g" "$file"
+    else
+        echo "${key} = ${value}" >> "$file"
+    fi
+}
+
+ensure_tun_device() {
+    echo -e "  -> 正在检查 TUN 虚拟网卡设备..."
+    if command_exists modprobe; then
+        modprobe tun 2>/dev/null || true
+    fi
+    mkdir -p /dev/net
+    if [ ! -c /dev/net/tun ]; then
+        if command_exists mknod; then
+            mknod /dev/net/tun c 10 200 2>/dev/null || true
+        fi
+    fi
+    if [ -c /dev/net/tun ]; then
+        chmod 600 /dev/net/tun 2>/dev/null || true
+    else
+        echo -e "${YELLOW}  -> 警告: 未能创建 /dev/net/tun。若运行在 LXC/OpenVZ/Docker，请在宿主机或容器参数中开启 TUN/TAP 与 NET_ADMIN 权限。${PLAIN}"
+    fi
+}
 
 # 1. Check root permissions
 if [ "$(id -u)" != "0" ]; then
@@ -67,8 +107,10 @@ elif [ "$PKG_MGR" = "apk" ]; then
     echo -e "  -> 正在运行 apk update 更新软件源清单..."
     apk update || true
     echo -e "  -> 正在运行 apk add 安装基础依赖包..."
-    # bash is required for this script itself and some internal logic
-    apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash
+    # bash is required for this script itself and some internal logic.
+    # openrc/kmod/iputils/procps make Alpine service, TUN, ping and sysctl behavior consistent.
+    apk add --no-cache openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash openrc kmod iputils procps
+    update-ca-certificates >/dev/null 2>&1 || true
 elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     echo -e "  -> 正在运行 $PKG_MGR 安装基础依赖包..."
     if [ "$OS_TYPE" != "fedora" ] && [ "$OS_TYPE" != "amzn" ]; then
@@ -78,6 +120,12 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     # Try installing packages. Note: iproute or iproute2
     $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute psmisc python3 || \
     $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+fi
+
+ensure_tun_device
+if [ "$OS_TYPE" = "alpine" ]; then
+    mkdir -p /run/openrc
+    touch /run/openrc/softlevel
 fi
 
 # 4. Clone or pull the repository
@@ -162,14 +210,38 @@ command_args="${INSTALL_DIR}/vpngate_manager.py"
 command_background="yes"
 directory="${INSTALL_DIR}"
 pidfile="/run/aimilivpn.pid"
+output_log="${INSTALL_DIR}/vpngate_data/openrc.out.log"
+error_log="${INSTALL_DIR}/vpngate_data/openrc.err.log"
 
 depend() {
-    need net
-    after firewall
+    need localmount
+    use net firewall dns
+    after modules
+}
+
+start_pre() {
+    checkpath -d -m 0755 -o root:root "${INSTALL_DIR}/vpngate_data"
+    mkdir -p /dev/net
+    modprobe tun 2>/dev/null || true
+    if [ ! -c /dev/net/tun ] && command -v mknod >/dev/null 2>&1; then
+        mknod /dev/net/tun c 10 200 2>/dev/null || true
+    fi
+    chmod 600 /dev/net/tun 2>/dev/null || true
 }
 EOF
     chmod +x /etc/init.d/aimilivpn
     rc-update add aimilivpn default
+    if [ "$OS_TYPE" = "alpine" ]; then
+        mkdir -p /etc/modules-load.d
+        echo "tun" > /etc/modules-load.d/aimilivpn.conf
+        if [ -f /etc/modules ] && ! grep -qx "tun" /etc/modules; then
+            echo "tun" >> /etc/modules
+        elif [ ! -f /etc/modules ]; then
+            echo "tun" > /etc/modules
+        fi
+        [ -x /etc/init.d/modules ] && rc-update add modules boot >/dev/null 2>&1 || true
+        [ -x /etc/init.d/sysctl ] && rc-update add sysctl boot >/dev/null 2>&1 || true
+    fi
 else
     echo -e "${YELLOW}警告: 未能检测到 systemd 或 OpenRC，请手动管理服务。${PLAIN}"
 fi
@@ -1073,24 +1145,24 @@ fi
 # 8.5 Optimize network parameters (rp_filter for policy routing)
 echo -e "\n正在优化网络参数 (配置反向路径过滤 rp_filter=2 以支持策略路由)..."
 if [ -d "/etc/sysctl.d" ]; then
-    cat > /etc/sysctl.d/99-aimilivpn.conf <<EOF
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-EOF
+    set_sysctl_value /etc/sysctl.d/99-aimilivpn.conf net.ipv4.ip_forward 1
+    set_sysctl_value /etc/sysctl.d/99-aimilivpn.conf net.ipv4.conf.all.rp_filter 2
+    set_sysctl_value /etc/sysctl.d/99-aimilivpn.conf net.ipv4.conf.default.rp_filter 2
     sysctl -p /etc/sysctl.d/99-aimilivpn.conf >/dev/null 2>&1 || true
 else
     # Fallback to appending to /etc/sysctl.conf
-    if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf; then
-        echo "" >> /etc/sysctl.conf
-        echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
-        echo "net.ipv4.conf.default.rp_filter = 2" >> /etc/sysctl.conf
-    else
-        sed -i 's/net.ipv4.conf.all.rp_filter\s*=\s*[0-9]/net.ipv4.conf.all.rp_filter = 2/g' /etc/sysctl.conf
-        sed -i 's/net.ipv4.conf.default.rp_filter\s*=\s*[0-9]/net.ipv4.conf.default.rp_filter = 2/g' /etc/sysctl.conf
-    fi
+    set_sysctl_value /etc/sysctl.conf net.ipv4.ip_forward 1
+    set_sysctl_value /etc/sysctl.conf net.ipv4.conf.all.rp_filter 2
+    set_sysctl_value /etc/sysctl.conf net.ipv4.conf.default.rp_filter 2
     sysctl -p >/dev/null 2>&1 || true
 fi
+if [ "$OS_TYPE" = "alpine" ]; then
+    set_sysctl_value /etc/sysctl.conf net.ipv4.ip_forward 1
+    set_sysctl_value /etc/sysctl.conf net.ipv4.conf.all.rp_filter 2
+    set_sysctl_value /etc/sysctl.conf net.ipv4.conf.default.rp_filter 2
+fi
 # Apply to currently active interfaces dynamically (prefer native proc write for BusyBox/Alpine compatibility)
+echo "1" > /proc/sys/net/ipv4/ip_forward 2>/dev/null || sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 echo "2" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
 echo "2" > /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
 if [ -d "/proc/sys/net/ipv4/conf" ]; then
