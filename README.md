@@ -25,6 +25,11 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
 ```
+#### Alpine 首次安装
+如果是极简 Alpine 系统，先安装 `bash` 与 `curl` 后再执行：
+```bash
+apk add --no-cache bash curl && curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh | bash
+```
 > 💡 **小贴士**：部署完成后，终端会输出管理网页的专属链接（含随机安全后缀，如 `http://your_vps_ip:8787/u71e9IXp4TPx`）。在终端中输入 `ml` 命令可以随时调出交互式命令行管理菜单。
 
 ---
@@ -72,6 +77,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 ### 🛠️ 核心功能与操作说明
 
 * **合并操作面板**：将“更新节点”与“立即检测补齐”合并，一键触发多线程拉取与测速。
+* **自动获取与历史节点库**：可在“代理及网络设置”中分别设置“自动获取新节点周期”和“可用性检查周期”，例如每 10 分钟拉取新节点、每 60 分钟筛选测速一次；历史节点会持续保存，支持连续失败次数自动淘汰、保留天数/最大数量限制、手动清理与节点库导出。
 * **网关状态面板**：
   - **系统诊断**：检测网关心跳及后台各个子守护线程（网页服务、VPN连接管理、出站网关服务）是否正常运行。若有脚本未运行，会提示具体的异常原因。
   - **本地代理出口检测**：在网页端直接一键检测 VPS 后台对海外的实际连通状况，并回显真实的代理出站 IP 和所在地理位置。
@@ -142,6 +148,11 @@ Run the corresponding command on your Linux VPS as root:
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
 ```
+#### Alpine First-Time Install
+On a minimal Alpine system, install `bash` and `curl` before running the installer:
+```bash
+apk add --no-cache bash curl && curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh | bash
+```
 
 > 💡 **Quick Note**: Once installed, copy the printed URL from the terminal to access the Web UI. Type the `ml` command in the terminal to summon the interactive CLI management console.
 
@@ -178,6 +189,10 @@ To prevent unauthorized scanning and abuse of the proxy port on the public inter
   Configure your scrapers, frameworks, or utility tools on this VPS to send traffic via `127.0.0.1:7928`.
 
 > 💡 **Quick Note**: If you really need to open this proxy port to the public internet, you can set the environment variable `export LOCAL_PROXY_HOST="::"` before running the manager.
+
+### 🛠️ Core Features
+
+* **Automatic Fetch & Node History**: Configure separate intervals for fetching new VPNGate nodes and checking node availability, such as fetching every 10 minutes while screening every 60 minutes. Historical nodes are retained, automatically pruned after consecutive failures, and can be manually cleaned or exported from the web UI.
 
 ---
 

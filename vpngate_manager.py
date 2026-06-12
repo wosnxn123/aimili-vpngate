@@ -127,6 +127,7 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+REMOVED_NODES_FILE = DATA_DIR / "removed_nodes.json"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -225,7 +226,14 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
-            "fav_fail_fallback": True
+            "fav_fail_fallback": True,
+            "keep_node_history": True,
+            "fetch_interval_minutes": max(1, FETCH_INTERVAL_SECONDS // 60),
+            "screen_interval_minutes": max(1, CHECK_INTERVAL_SECONDS // 60),
+            "node_retest_interval_minutes": 60,
+            "delete_after_failures": 5,
+            "node_retention_days": 0,
+            "max_saved_nodes": 3000
         }
         updated = False
         if auth_file.exists():
@@ -233,7 +241,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "keep_node_history", "fetch_interval_minutes", "screen_interval_minutes", "node_retest_interval_minutes", "delete_after_failures", "node_retention_days", "max_saved_nodes"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -260,6 +268,41 @@ def load_ui_config() -> dict[str, Any]:
             normalized_proxy_port = fallback_proxy_port
         if normalized_proxy_port != config.get("proxy_port"):
             config["proxy_port"] = normalized_proxy_port
+            updated = True
+
+        normalized_fetch_interval = bounded_int(config.get("fetch_interval_minutes"), max(1, FETCH_INTERVAL_SECONDS // 60), 1, 1440)
+        if normalized_fetch_interval != config.get("fetch_interval_minutes"):
+            config["fetch_interval_minutes"] = normalized_fetch_interval
+            updated = True
+
+        normalized_screen_interval = bounded_int(config.get("screen_interval_minutes"), max(1, CHECK_INTERVAL_SECONDS // 60), 1, 1440)
+        if normalized_screen_interval != config.get("screen_interval_minutes"):
+            config["screen_interval_minutes"] = normalized_screen_interval
+            updated = True
+
+        normalized_retest_interval = bounded_int(config.get("node_retest_interval_minutes"), normalized_screen_interval, 1, 10080)
+        if normalized_retest_interval != config.get("node_retest_interval_minutes"):
+            config["node_retest_interval_minutes"] = normalized_retest_interval
+            updated = True
+
+        normalized_delete_after = bounded_int(config.get("delete_after_failures"), 5, 0, 100)
+        if normalized_delete_after != config.get("delete_after_failures"):
+            config["delete_after_failures"] = normalized_delete_after
+            updated = True
+
+        normalized_retention_days = bounded_int(config.get("node_retention_days"), 0, 0, 3650)
+        if normalized_retention_days != config.get("node_retention_days"):
+            config["node_retention_days"] = normalized_retention_days
+            updated = True
+
+        normalized_max_saved = bounded_int(config.get("max_saved_nodes"), 3000, 0, 20000)
+        if normalized_max_saved != config.get("max_saved_nodes"):
+            config["max_saved_nodes"] = normalized_max_saved
+            updated = True
+
+        normalized_keep_history = bool(config.get("keep_node_history", True))
+        if normalized_keep_history != config.get("keep_node_history"):
+            config["keep_node_history"] = normalized_keep_history
             updated = True
             
         if not auth_file.exists() or updated:
@@ -355,8 +398,8 @@ def get_state() -> dict[str, Any]:
     state["is_connecting"] = is_connecting
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
-    state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
-    state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
+    state["fetch_interval_seconds"] = get_fetch_interval_seconds()
+    state["check_interval_seconds"] = get_screen_interval_seconds()
     _proxy_display = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
     state["local_proxy"] = f"http://{_proxy_display}:{LOCAL_PROXY_PORT}"
     state.setdefault("last_fetch_status", "not_started")
@@ -377,6 +420,26 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = ui_cfg.get("fav_fail_fallback", True)
+    state["keep_node_history"] = ui_cfg.get("keep_node_history", True)
+    state["fetch_interval_minutes"] = ui_cfg.get("fetch_interval_minutes", max(1, FETCH_INTERVAL_SECONDS // 60))
+    state["screen_interval_minutes"] = ui_cfg.get("screen_interval_minutes", max(1, CHECK_INTERVAL_SECONDS // 60))
+    state["node_retest_interval_minutes"] = ui_cfg.get("node_retest_interval_minutes", 60)
+    state["delete_after_failures"] = ui_cfg.get("delete_after_failures", 5)
+    state["node_retention_days"] = ui_cfg.get("node_retention_days", 0)
+    state["max_saved_nodes"] = ui_cfg.get("max_saved_nodes", 3000)
+
+    try:
+        nodes = read_nodes()
+        removed_nodes = read_json(REMOVED_NODES_FILE, [])
+        state["saved_nodes"] = len(nodes)
+        state["stale_nodes"] = len([n for n in nodes if n.get("stale")])
+        state["failed_nodes"] = len([n for n in nodes if int(n.get("fail_count") or 0) > 0])
+        state["removed_nodes"] = len(removed_nodes) if isinstance(removed_nodes, list) else 0
+    except Exception:
+        state.setdefault("saved_nodes", 0)
+        state.setdefault("stale_nodes", 0)
+        state.setdefault("failed_nodes", 0)
+        state.setdefault("removed_nodes", 0)
     
     return state
 
@@ -406,6 +469,184 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+def parse_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+def stripped_node(node: dict[str, Any]) -> dict[str, Any]:
+    stripped = node.copy()
+    stripped.pop("config_text", None)
+    return stripped
+
+def get_fetch_interval_seconds() -> int:
+    ui_cfg = load_ui_config()
+    minutes = bounded_int(ui_cfg.get("fetch_interval_minutes"), max(1, FETCH_INTERVAL_SECONDS // 60), 1, 1440)
+    return max(60, minutes * 60)
+
+def get_screen_interval_seconds() -> int:
+    ui_cfg = load_ui_config()
+    minutes = bounded_int(ui_cfg.get("screen_interval_minutes"), max(1, CHECK_INTERVAL_SECONDS // 60), 1, 1440)
+    return max(60, minutes * 60)
+
+def merge_candidate_node(existing: dict[str, Any] | None, candidate: dict[str, Any], now: float) -> dict[str, Any]:
+    if not existing:
+        merged = candidate.copy()
+        merged["first_seen_at"] = candidate.get("fetched_at") or now
+        merged["seen_count"] = 1
+        merged["fail_count"] = 0
+    else:
+        merged = existing.copy()
+        preserved = {
+            key: existing.get(key)
+            for key in [
+                "latency_ms",
+                "probe_status",
+                "probe_message",
+                "probed_at",
+                "owner",
+                "asn",
+                "as_name",
+                "location",
+                "ip_type",
+                "quality",
+                "fail_count",
+                "last_failed_at",
+                "last_success_at",
+            ]
+            if key in existing
+        }
+        merged.update(candidate)
+        for key, value in preserved.items():
+            if value not in ("", None) or key in ("probe_status", "fail_count", "probed_at"):
+                merged[key] = value
+        merged["first_seen_at"] = existing.get("first_seen_at") or existing.get("fetched_at") or candidate.get("fetched_at") or now
+        merged["seen_count"] = parse_int(existing.get("seen_count")) + 1
+    merged["last_seen_at"] = now
+    merged["missing_cycles"] = 0
+    merged["stale"] = False
+    return merged
+
+def mark_node_missing(node: dict[str, Any], now: float) -> dict[str, Any]:
+    updated = node.copy()
+    updated.setdefault("first_seen_at", updated.get("fetched_at") or now)
+    updated.setdefault("last_seen_at", updated.get("fetched_at") or now)
+    updated["missing_cycles"] = parse_int(updated.get("missing_cycles")) + 1
+    updated["stale"] = True
+    return updated
+
+def apply_probe_counters(node: dict[str, Any], ok: bool, probed_at: float | None = None) -> None:
+    ts = probed_at or time.time()
+    if ok:
+        node["fail_count"] = 0
+        node["last_success_at"] = ts
+    else:
+        node["fail_count"] = parse_int(node.get("fail_count")) + 1
+        node["last_failed_at"] = ts
+
+def archive_removed_nodes(nodes: list[dict[str, Any]], reason: str) -> None:
+    if not nodes:
+        return
+    archive = read_json(REMOVED_NODES_FILE, [])
+    if not isinstance(archive, list):
+        archive = []
+    now = time.time()
+    for node in nodes:
+        archived = stripped_node(node)
+        archived["removed_at"] = now
+        archived["removal_reason"] = reason
+        archive.append(archived)
+        config_file = node.get("config_file")
+        if config_file:
+            try:
+                path = Path(str(config_file))
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+    write_json(REMOVED_NODES_FILE, archive[-2000:])
+
+def prune_nodes_by_policy(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any], reason: str) -> tuple[list[dict[str, Any]], int]:
+    now = time.time()
+    delete_after = bounded_int(ui_cfg.get("delete_after_failures"), 5, 0, 100)
+    retention_days = bounded_int(ui_cfg.get("node_retention_days"), 0, 0, 3650)
+    max_saved = bounded_int(ui_cfg.get("max_saved_nodes"), 3000, 0, 20000)
+    protected_ids = set(str(x) for x in ui_cfg.get("favorite_node_ids", []) if x)
+    fixed_id = str(ui_cfg.get("fixed_node_id") or "")
+    if fixed_id:
+        protected_ids.add(fixed_id)
+    if active_openvpn_node_id:
+        protected_ids.add(active_openvpn_node_id)
+
+    kept: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    retention_seconds = retention_days * 24 * 3600
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        is_protected = bool(node.get("active")) or node_id in protected_ids
+        should_remove = False
+        remove_reason = reason
+        if not is_protected and delete_after > 0 and parse_int(node.get("fail_count")) >= delete_after:
+            should_remove = True
+            remove_reason = f"{reason}: consecutive_failures>={delete_after}"
+        elif not is_protected and retention_seconds > 0 and node.get("stale"):
+            last_seen = parse_float(node.get("last_seen_at") or node.get("fetched_at"))
+            if last_seen and now - last_seen > retention_seconds:
+                should_remove = True
+                remove_reason = f"{reason}: stale_retention_days>{retention_days}"
+        if should_remove:
+            removed_node = node.copy()
+            removed_node["removal_reason"] = remove_reason
+            removed.append(removed_node)
+        else:
+            kept.append(node)
+
+    if max_saved > 0 and len(kept) > max_saved:
+        extra_count = len(kept) - max_saved
+        removable = [
+            node for node in kept
+            if not node.get("active") and str(node.get("id") or "") not in protected_ids
+        ]
+        status_weight = {"unavailable": 3, "not_checked": 2, "available": 1}
+        removable.sort(
+            key=lambda n: (
+                status_weight.get(str(n.get("probe_status") or ""), 0),
+                parse_int(n.get("fail_count")),
+                parse_int(n.get("missing_cycles")),
+                -parse_float(n.get("last_seen_at") or n.get("fetched_at")),
+            ),
+            reverse=True,
+        )
+        remove_ids = set(str(n.get("id") or "") for n in removable[:extra_count])
+        trimmed: list[dict[str, Any]] = []
+        for node in kept:
+            if str(node.get("id") or "") in remove_ids:
+                removed_node = node.copy()
+                removed_node["removal_reason"] = f"{reason}: max_saved_nodes>{max_saved}"
+                removed.append(removed_node)
+            else:
+                trimmed.append(node)
+        kept = trimmed
+
+    archive_removed_nodes(removed, reason)
+    if removed:
+        log_to_json("INFO", "Main", f"节点生命周期清理完成，移除 {len(removed)} 个节点，原因: {reason}")
+    return kept, len(removed)
+
+def select_nodes_due_for_probe(nodes: list[dict[str, Any]], force: bool, ui_cfg: dict[str, Any]) -> list[str]:
+    now = time.time()
+    retest_seconds = bounded_int(ui_cfg.get("screen_interval_minutes"), max(1, CHECK_INTERVAL_SECONDS // 60), 1, 1440) * 60
+    selected: list[str] = []
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        if not node_id or node.get("active"):
+            continue
+        probed_at = parse_float(node.get("probed_at"))
+        if force or probed_at <= 0 or now - probed_at >= retest_seconds:
+            selected.append(node_id)
+    return selected
 
 def proxy_basic_auth_header(username: str, password: str) -> str:
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
@@ -1244,6 +1485,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
+            apply_probe_counters(node, ok, node["probed_at"])
             if ok:
                 node["owner"] = temp_node["owner"]
                 node["asn"] = temp_node["asn"]
@@ -1259,7 +1501,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         else:
             return {}
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+def test_multiple_nodes(node_ids: list[str], prune_after: bool = False) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
@@ -1354,7 +1596,11 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
+                result = updated_nodes_map[nid]
+                n.update(result)
+                apply_probe_counters(n, result.get("probe_status") == "available", parse_float(result.get("probed_at")) or None)
+        if prune_after:
+            current_nodes, _ = prune_nodes_by_policy(current_nodes, load_ui_config(), "probe_policy")
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
         
@@ -1569,7 +1815,7 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
-def maintain_valid_nodes(force: bool = False) -> str:
+def maintain_valid_nodes(force: bool = False, fetch_nodes: bool = True, screen_nodes: bool = True) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
     if not maintenance_lock.acquire(blocking=False):
@@ -1610,64 +1856,92 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         auto_switch_node()
                         is_connecting = True
 
-        try:
-            set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
-            candidates = fetch_candidates()
-        except Exception as exc:
-            vpn_utils.check_and_fix_dns()
-            diag_msg = str(exc)
-            if not any(token in diag_msg for token in ["[ERR_", "错误代码"]):
-                err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
-                diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
-            set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
-            candidates = []
+        candidates: list[dict[str, Any]] = []
+        if fetch_nodes:
+            try:
+                set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
+                candidates = fetch_candidates()
+            except Exception as exc:
+                vpn_utils.check_and_fix_dns()
+                diag_msg = str(exc)
+                if not any(token in diag_msg for token in ["[ERR_", "错误代码"]):
+                    err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
+                    diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
+                set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
+                candidates = []
+        else:
+            set_state(last_fetch_message="本轮未到自动获取周期，跳过拉取新节点")
 
-        if not candidates:
-            return "没有拉取到新节点"
+        if fetch_nodes and not candidates:
+            ui_cfg = load_ui_config()
+            existing_nodes = read_nodes()
+            if not screen_nodes or not ui_cfg.get("keep_node_history", True) or not existing_nodes:
+                return "没有拉取到新节点"
+            log_to_json("WARNING", "Main", "本轮未拉取到新节点，将继续使用历史节点库进行筛选")
 
-        with lock:
-            active_node = None
-            if active_openvpn_node_id:
+        ui_cfg = load_ui_config()
+        keep_history = bool(ui_cfg.get("keep_node_history", True))
+        now = time.time()
+        current_candidate_ids = {str(c.get("id") or "") for c in candidates}
+
+        if fetch_nodes:
+            with lock:
                 current_nodes = read_nodes()
-                active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
-                
-            merged: list[dict[str, Any]] = []
-            seen_ids: set[str] = set()
-            
-            if active_node:
-                merged.append(active_node)
-                seen_ids.add(active_node["id"])
-                
-            for cand in candidates:
-                if cand["id"] not in seen_ids:
-                    merged.append(cand)
-                    seen_ids.add(cand["id"])
-                    
-            if len(merged) > 1000:
-                merged = merged[:1000]
-                
-            for n in merged:
-                config_path = Path(n["config_file"])
-                if not config_path.exists():
-                    try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
-                    except Exception:
-                        pass
-                        
-            write_json(NODES_FILE, merged)
+                existing_by_id = {str(n.get("id") or ""): n for n in current_nodes if n.get("id")}
+                merged_by_id: dict[str, dict[str, Any]] = {}
 
-        # Test all non-active nodes from the list
-        with lock:
-            current_nodes = read_nodes()
-            to_test = [n for n in current_nodes if not n.get("active")]
-            to_test_ids = [n["id"] for n in to_test]
+                for cand in candidates:
+                    node_id = str(cand.get("id") or "")
+                    if not node_id:
+                        continue
+                    merged_by_id[node_id] = merge_candidate_node(existing_by_id.get(node_id), cand, now)
+
+                if keep_history:
+                    for node_id, node in existing_by_id.items():
+                        if node_id and node_id not in merged_by_id:
+                            merged_by_id[node_id] = mark_node_missing(node, now)
+                elif active_openvpn_node_id and active_openvpn_node_id in existing_by_id and active_openvpn_node_id not in merged_by_id:
+                    merged_by_id[active_openvpn_node_id] = existing_by_id[active_openvpn_node_id]
+
+                merged = list(merged_by_id.values())
+                for n in merged:
+                    n["active"] = bool(active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
+                    config_path = Path(n["config_file"])
+                    if n.get("config_text") and not config_path.exists():
+                        try:
+                            config_path.write_text(n["config_text"], encoding="utf-8")
+                        except Exception:
+                            pass
+
+                merged, _ = prune_nodes_by_policy(merged, ui_cfg, "merge_policy")
+                write_json(NODES_FILE, sort_all_nodes(merged))
+
+        to_test_ids: list[str] = []
+        if screen_nodes:
+            # Test nodes that have never been checked or whose availability interval has expired.
+            with lock:
+                current_nodes = read_nodes()
+                if force:
+                    to_test_ids = select_nodes_due_for_probe(current_nodes, True, ui_cfg)
+                else:
+                    due_ids = set(select_nodes_due_for_probe(current_nodes, False, ui_cfg))
+                    new_ids = {
+                        n["id"] for n in current_nodes
+                        if n.get("id") in current_candidate_ids and parse_float(n.get("probed_at")) <= 0 and not n.get("active")
+                    }
+                    to_test_ids = sorted(due_ids | new_ids)
+                
+            msg = f"开始对新增或到期节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
+            print(f"[周期检测] {msg}", flush=True)
+            log_to_json("INFO", "Main", msg)
             
-        msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
-        print(f"[周期检测] {msg}", flush=True)
-        log_to_json("INFO", "Main", msg)
-        
-        set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-        test_multiple_nodes(to_test_ids)
+            if to_test_ids:
+                set_state(is_connecting=True, last_check_message=f"正在并发检测 {len(to_test_ids)} 个到期节点可用性...")
+                test_multiple_nodes(to_test_ids, prune_after=True)
+            else:
+                set_state(is_connecting=True, last_check_message="节点历史库已是最新，本轮无需重复筛选")
+        elif fetch_nodes:
+            set_state(is_connecting=True, last_check_message=f"已获取并保存 {len(candidates)} 个候选节点，本轮未到可用性检查周期")
         is_connecting = False
         
         with lock:
@@ -1728,7 +2002,16 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."
+        parts = []
+        if fetch_nodes:
+            parts.append(f"Fetched {len(candidates)} nodes")
+        else:
+            parts.append("Skipped fetch")
+        if screen_nodes:
+            parts.append(f"Tested {len(to_test_ids)} nodes")
+        else:
+            parts.append("Skipped availability check")
+        message = ". ".join(parts) + "."
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -1745,27 +2028,55 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
 def collector_loop() -> None:
     global last_collector_heartbeat
+    next_fetch_at = 0.0
+    next_screen_at = 0.0
     while True:
         last_collector_heartbeat = time.time()
         success = False
+        now = time.time()
+        fetch_due = now >= next_fetch_at
+        screen_due = now >= next_screen_at
         try:
-            print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
-            log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
-            res = maintain_valid_nodes(force=False)
-            if "没有拉取到新节点" not in res:
-                success = True
-            log_to_json("INFO", "Main", f"周期同步与检测任务完成，结果: {res}")
+            if fetch_due or screen_due:
+                task_names = []
+                if fetch_due:
+                    task_names.append("自动获取新节点")
+                if screen_due:
+                    task_names.append("可用性检查")
+                task_label = " + ".join(task_names)
+                print(f"[守护线程] 开始执行周期任务: {task_label}", flush=True)
+                log_to_json("INFO", "Main", f"开始执行周期任务: {task_label}")
+                res = maintain_valid_nodes(force=False, fetch_nodes=fetch_due, screen_nodes=screen_due)
+                if "没有拉取到新节点" not in res:
+                    success = True
+                log_to_json("INFO", "Main", f"周期任务完成，结果: {res}")
+                now = time.time()
+                if fetch_due:
+                    next_fetch_at = now + get_fetch_interval_seconds()
+                if screen_due:
+                    next_screen_at = now + get_screen_interval_seconds()
         except Exception as exc:
             err_msg = f"周期节点同步任务执行异常: {exc}"
             print(f"[错误] {err_msg}", flush=True)
             log_to_json("ERROR", "Main", err_msg)
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
+            now = time.time()
+            if fetch_due:
+                next_fetch_at = now + 30
+            if screen_due:
+                next_screen_at = now + 30
             
+        now = time.time()
         if not active_openvpn_running() and not success:
             sleep_time = 30
+            if next_fetch_at > now + sleep_time:
+                next_fetch_at = now + sleep_time
+            if next_screen_at > now + sleep_time:
+                next_screen_at = now + sleep_time
         else:
-            sleep_time = CHECK_INTERVAL_SECONDS
-            
+            next_due = min(next_fetch_at, next_screen_at)
+            sleep_time = max(5, min(60, int(next_due - now)))
+
         time.sleep(sleep_time)
 
 LOGIN_HTML = r"""<!DOCTYPE html>
@@ -3169,6 +3480,40 @@ INDEX_HTML = r"""<!doctype html>
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
+          <label style="display: flex; align-items: center; gap: 8px; color: var(--text-primary); font-size: 13px; font-weight: 600; margin-bottom: 12px;">
+            <input type="checkbox" id="net_keep_node_history" style="width: 16px; height: 16px;">
+            保存历史节点
+          </label>
+          <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;">
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="net_fetch_interval_minutes">自动获取新节点周期(分钟)</label>
+              <input type="number" id="net_fetch_interval_minutes" class="input-field" min="1" max="1440" placeholder="10">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="net_screen_interval_minutes">可用性检查周期(分钟)</label>
+              <input type="number" id="net_screen_interval_minutes" class="input-field" min="1" max="1440" placeholder="21">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="net_delete_after_failures">失败淘汰次数</label>
+              <input type="number" id="net_delete_after_failures" class="input-field" min="0" max="100" placeholder="5">
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="net_node_retention_days">历史保留天数</label>
+              <input type="number" id="net_node_retention_days" class="input-field" min="0" max="3650" placeholder="0">
+            </div>
+            <div class="form-group" style="margin-bottom: 0; grid-column: span 2;">
+              <label class="form-label" for="net_max_saved_nodes">最多保存节点数</label>
+              <input type="number" id="net_max_saved_nodes" class="input-field" min="0" max="20000" placeholder="3000">
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 12px;">
+            <button type="button" onclick="exportNodeHistory()" style="height: 34px; padding: 0 12px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: rgba(255,255,255,0.03); color: var(--text-primary); cursor: pointer;">导出节点库</button>
+            <button type="button" onclick="pruneNodeHistory()" style="height: 34px; padding: 0 12px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: rgba(255,255,255,0.03); color: var(--text-primary); cursor: pointer;">立即清理</button>
+          </div>
+          <div id="net_node_history_stats" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;"></div>
+        </div>
+
+        <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">IP 出站路由模式</label>
             <input type="hidden" id="net_routing_mode" value="auto">
@@ -4331,11 +4676,21 @@ function openNetworkModal() {
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
+    $("net_keep_node_history").checked = state.keep_node_history !== false;
+    $("net_fetch_interval_minutes").value = state.fetch_interval_minutes || 21;
+    $("net_screen_interval_minutes").value = state.screen_interval_minutes || 21;
+    $("net_delete_after_failures").value = state.delete_after_failures ?? 5;
+    $("net_node_retention_days").value = state.node_retention_days ?? 0;
+    $("net_max_saved_nodes").value = state.max_saved_nodes ?? 3000;
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
     
     selectOptionCard('routing_mode', mode);
     selectOptionCard('routing_ip_type', ipType);
+    const statsEl = $("net_node_history_stats");
+    if (statsEl) {
+      statsEl.textContent = `节点库：已保存 ${state.saved_nodes || 0} 个，历史 ${state.stale_nodes || 0} 个，连续失败 ${state.failed_nodes || 0} 个，已清理 ${state.removed_nodes || 0} 个。`;
+    }
   }
   
   populateRoutingCountries();
@@ -4360,6 +4715,12 @@ async function saveNetwork(e) {
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
+  const keepNodeHistory = $("net_keep_node_history").checked;
+  const fetchIntervalMinutes = parseInt($("net_fetch_interval_minutes").value);
+  const screenIntervalMinutes = parseInt($("net_screen_interval_minutes").value);
+  const deleteAfterFailures = parseInt($("net_delete_after_failures").value);
+  const nodeRetentionDays = parseInt($("net_node_retention_days").value);
+  const maxSavedNodes = parseInt($("net_max_saved_nodes").value);
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -4378,6 +4739,32 @@ async function saveNetwork(e) {
     errorDivEl.style.display = "block";
     return;
   }
+
+  if (isNaN(fetchIntervalMinutes) || fetchIntervalMinutes < 1 || fetchIntervalMinutes > 1440) {
+    errorDivEl.textContent = "自动获取新节点周期必须在 1 至 1440 分钟之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  if (isNaN(screenIntervalMinutes) || screenIntervalMinutes < 1 || screenIntervalMinutes > 1440) {
+    errorDivEl.textContent = "可用性检查周期必须在 1 至 1440 分钟之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  if (isNaN(deleteAfterFailures) || deleteAfterFailures < 0 || deleteAfterFailures > 100) {
+    errorDivEl.textContent = "失败淘汰次数必须在 0 至 100 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  if (isNaN(nodeRetentionDays) || nodeRetentionDays < 0 || nodeRetentionDays > 3650) {
+    errorDivEl.textContent = "历史保留天数必须在 0 至 3650 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  if (isNaN(maxSavedNodes) || maxSavedNodes < 0 || maxSavedNodes > 20000) {
+    errorDivEl.textContent = "最多保存节点数必须在 0 至 20000 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
   
   submitBtn.disabled = true;
   submitBtn.textContent = "正在保存...";
@@ -4390,7 +4777,13 @@ async function saveNetwork(e) {
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+        routing_ip_type: routingIpType,
+        keep_node_history: keepNodeHistory,
+        fetch_interval_minutes: fetchIntervalMinutes,
+        screen_interval_minutes: screenIntervalMinutes,
+        delete_after_failures: deleteAfterFailures,
+        node_retention_days: nodeRetentionDays,
+        max_saved_nodes: maxSavedNodes
       })
     });
     
@@ -4425,6 +4818,55 @@ async function saveNetwork(e) {
     errorDivEl.style.display = "block";
     submitBtn.disabled = false;
     submitBtn.textContent = "保存修改";
+  }
+}
+
+async function exportNodeHistory() {
+  try {
+    const res = await fetch("./api/export_nodes");
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert("导出节点库失败: " + (data.error || "未知错误"));
+      return;
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const dateStr = new Date().toISOString().slice(0, 10);
+    a.download = `aimilivpn_nodes_${dateStr}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert("导出节点库失败，请稍后重试");
+  }
+}
+
+async function pruneNodeHistory() {
+  const errorDivEl = $("network_error");
+  const successDiv = $("network_success");
+  errorDivEl.style.display = "none";
+  successDiv.style.display = "none";
+  try {
+    const res = await fetch("./api/prune_nodes", { method: "POST" });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      successDiv.textContent = data.message || "清理完成";
+      successDiv.style.display = "block";
+      await load();
+      const statsEl = $("net_node_history_stats");
+      if (statsEl) {
+        statsEl.textContent = `节点库：已保存 ${state.saved_nodes || 0} 个，历史 ${state.stale_nodes || 0} 个，连续失败 ${state.failed_nodes || 0} 个，已清理 ${state.removed_nodes || 0} 个。`;
+      }
+    } else {
+      errorDivEl.textContent = data.error || "清理失败";
+      errorDivEl.style.display = "block";
+    }
+  } catch (err) {
+    errorDivEl.textContent = "清理失败，请稍后重试";
+    errorDivEl.style.display = "block";
   }
 }
 
@@ -4986,6 +5428,22 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/export_nodes":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            include_config = str(query.get("include_config", ["0"])[0]).lower() in ("1", "true", "yes")
+            nodes = read_nodes()
+            removed_nodes = read_json(REMOVED_NODES_FILE, [])
+            if not include_config:
+                nodes = [stripped_node(n) for n in nodes]
+            if not isinstance(removed_nodes, list):
+                removed_nodes = []
+            self.send_json({
+                "ok": True,
+                "exported_at": time.time(),
+                "nodes": nodes,
+                "removed_nodes": removed_nodes,
+                "state": get_state(),
+            })
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
@@ -5248,6 +5706,13 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                keep_node_history = bool(payload.get("keep_node_history", True))
+                fetch_interval_minutes = bounded_int(payload.get("fetch_interval_minutes"), max(1, FETCH_INTERVAL_SECONDS // 60), 1, 1440)
+                screen_interval_minutes = bounded_int(payload.get("screen_interval_minutes"), max(1, CHECK_INTERVAL_SECONDS // 60), 1, 1440)
+                node_retest_interval_minutes = bounded_int(payload.get("node_retest_interval_minutes", screen_interval_minutes), screen_interval_minutes, 1, 10080)
+                delete_after_failures = bounded_int(payload.get("delete_after_failures"), 5, 0, 100)
+                node_retention_days = bounded_int(payload.get("node_retention_days"), 0, 0, 3650)
+                max_saved_nodes = bounded_int(payload.get("max_saved_nodes"), 3000, 0, 20000)
                 
                 try:
                     new_proxy_port_int = int(new_proxy_port)
@@ -5275,6 +5740,13 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["keep_node_history"] = keep_node_history
+                ui_cfg["fetch_interval_minutes"] = fetch_interval_minutes
+                ui_cfg["screen_interval_minutes"] = screen_interval_minutes
+                ui_cfg["node_retest_interval_minutes"] = node_retest_interval_minutes
+                ui_cfg["delete_after_failures"] = delete_after_failures
+                ui_cfg["node_retention_days"] = node_retention_days
+                ui_cfg["max_saved_nodes"] = max_saved_nodes
                 
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
@@ -5367,6 +5839,16 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
                     self.send_json({"ok": True, "message": "已在后台启动节点更新流程", "running": False})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/prune_nodes":
+            try:
+                self.read_request_body()
+                with lock:
+                    nodes = read_nodes()
+                    pruned_nodes, removed_count = prune_nodes_by_policy(nodes, load_ui_config(), "manual_prune")
+                    write_json(NODES_FILE, sort_all_nodes(pruned_nodes))
+                self.send_json({"ok": True, "removed": removed_count, "message": f"已清理 {removed_count} 个符合策略的历史节点"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
@@ -5472,8 +5954,8 @@ def main() -> None:
         {
             "api_url": API_URL,
             "target_valid_nodes": TARGET_VALID_NODES,
-            "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
-            "check_interval_seconds": CHECK_INTERVAL_SECONDS,
+            "fetch_interval_seconds": get_fetch_interval_seconds(),
+            "check_interval_seconds": get_screen_interval_seconds(),
             "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",
